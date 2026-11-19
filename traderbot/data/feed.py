@@ -16,6 +16,11 @@ from traderbot.models import CANDLE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
+# The local PC clock can run a few seconds ahead of the exchange. The newest candle in a
+# response is only trusted as closed once the exchange has started a newer candle, or once
+# its close time is at least this long ago by the local clock.
+CLOSE_GRACE_MS = 10_000
+
 
 class DataFeedError(Exception):
     """A market-data problem with a friendly message that is safe to show in the GUI."""
@@ -108,11 +113,18 @@ class MarketDataFeed:
 
         A candle that started at `timestamp` closes at `timestamp + timeframe_ms`.
         If that moment is later than `now_ms` the candle is still forming and is
-        dropped, so strategies only ever see final prices.
+        dropped, so strategies only ever see final prices. Because the local clock
+        may run ahead of the exchange, the newest row is also dropped unless it closed
+        at least CLOSE_GRACE_MS ago (rows followed by a newer row are certainly closed).
         """
         if limit < 1:
             raise ValueError("limit must be at least 1")
         tf_ms = timeframe_to_ms(timeframe)
+        timeframes = getattr(self._exchange, "timeframes", None)
+        if isinstance(timeframes, dict) and timeframes and timeframe not in timeframes:
+            raise DataFeedError(
+                f"{self.exchange_id} does not offer {timeframe} candles. Choose another timeframe."
+            )
         try:
             # Ask for one extra row because the newest one is usually still forming.
             rows = self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit + 1)
@@ -134,8 +146,13 @@ class MarketDataFeed:
 
         df = df.drop_duplicates(subset="timestamp", keep="last")
         df = df.sort_values("timestamp", kind="stable")
+        newest_ts = df["timestamp"].iloc[-1] if not df.empty else None
         # Exactly at the close time the candle is final; any later close time = still forming.
         df = df[df["timestamp"] + tf_ms <= now_ms]
+        if not df.empty and int(df["timestamp"].iloc[-1]) == int(newest_ts) \
+                and int(newest_ts) + tf_ms + CLOSE_GRACE_MS > now_ms:
+            # The newest row may still be forming if the local clock runs ahead.
+            df = df.iloc[:-1]
         df = df.tail(limit).reset_index(drop=True)
         return df
 

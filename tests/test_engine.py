@@ -362,10 +362,11 @@ def test_empty_candles_does_not_start_watching(make):
     s = make(BUY_CROSS)
     s.engine.start()
     result = s.step_at(0)                   # no candle closed yet
-    assert result.error is None
+    assert result.error is not None and result.error.startswith("Not enough candle history")
     assert result.candles is not None and result.candles.empty
     assert WATCHING_MESSAGE not in result.messages
     nxt = s.step_at(6)
+    assert nxt.error is None
     assert WATCHING_MESSAGE in nxt.messages
     assert nxt.new_trades == []
 
@@ -628,3 +629,110 @@ def test_restart_resets_first_step_watching(make):
     result = s.step_at(6)
     assert result.new_trades == []
     assert WATCHING_MESSAGE in result.messages
+
+
+# --------------------------------------------------------------------------- positions in other symbols
+OTHER = "ETH/USDT"
+
+
+class MultiFeed(FakeFeed):
+    """FakeFeed with a separate last price per symbol; symbols in ``failing`` raise DataFeedError."""
+
+    def __init__(self, closes: list[float], prices: dict[str, float]) -> None:
+        super().__init__(closes)
+        self.prices = dict(prices)
+        self.failing: set[str] = set()
+
+    def fetch_last_price(self, symbol):
+        self.price_calls.append(symbol)
+        if symbol in self.failing:
+            raise DataFeedError(f"Unknown trading pair {symbol} on binance")
+        return self.prices[symbol]
+
+
+def _switched_pair_setup(make, prices: dict[str, float], **overrides) -> Setup:
+    """A BTC/USDT position bought at 100 (earlier run), bot now configured for ETH/USDT."""
+    s = make(FLAT, symbol=OTHER, **overrides)
+    s.broker.market_buy(SYM, 1000.0, 100.0, T0 - DAY_MS, TradeReason.SIGNAL)
+    s.feed = MultiFeed(FLAT, prices)
+    s.engine = BotEngine(s.config, s.feed, s.broker, s.storage, clock=s.clock)
+    return s
+
+
+def test_position_in_other_symbol_is_valued_at_market_and_stop_loss_applies(make):
+    s = _switched_pair_setup(make, {OTHER: 10.0, SYM: 60.0}, stop_loss_pct=10.0)
+    amount = s.broker.get_position(SYM).amount
+    s.engine.start()
+    result = s.step_at(5)
+    # BTC is 40% below its cost: the stop-loss sells it even though the bot runs on ETH.
+    assert [(t.symbol, t.reason) for t in result.new_trades] == [(SYM, TradeReason.STOP_LOSS)]
+    assert s.broker.get_position(SYM) is None
+    assert result.account.equity == pytest.approx(9000.0 + result.new_trades[0].quote_value)
+    assert result.account.equity < 9000.0 + amount * 60.0 + 1e-9
+
+
+def test_equity_and_day_start_value_other_symbol_at_market(make):
+    s = _switched_pair_setup(make, {OTHER: 10.0, SYM: 60.0}, max_daily_loss_pct=5.0)
+    amount = s.broker.get_position(SYM).amount
+    s.engine.start()
+    result = s.step_at(5)
+    true_equity = 9000.0 + amount * 60.0
+    assert result.account.equity == pytest.approx(true_equity, rel=1e-12)
+    assert result.account.mark_prices == {SYM: 60.0}
+    assert s.storage.get_meta(utc_day_key(at(5))) == pytest.approx(true_equity, rel=1e-12)
+    assert result.halted is False
+    # Nothing was lost today, so a restart on the same UTC day is allowed.
+    s.engine.start()
+
+
+def test_daily_limit_closes_position_in_other_symbol(make):
+    s = _switched_pair_setup(make, {OTHER: 10.0, SYM: 100.0}, max_daily_loss_pct=5.0)
+    s.engine.start()
+    assert s.step_at(5).halted is False                 # day start with BTC at 100
+    s.feed.prices[SYM] = 40.0                           # equity drops ~6% -> limit
+    result = s.step_at(5)
+    assert result.halted is True
+    assert [(t.symbol, t.reason) for t in result.new_trades] == [(SYM, TradeReason.DAILY_LIMIT)]
+    assert s.broker.positions() == {}
+
+
+def test_other_symbol_without_price_uses_last_known_price_and_warns_once(make):
+    s = _switched_pair_setup(make, {OTHER: 10.0, SYM: 60.0}, max_daily_loss_pct=5.0)
+    amount = s.broker.get_position(SYM).amount
+    s.engine.start()
+    s.step_at(5)                                         # BTC priced at 60 and remembered
+    s.feed.failing.add(SYM)
+    first = s.step_at(5)
+    assert first.error is None
+    assert sum("Could not get a price for the open BTC/USDT" in m for m in first.messages) == 1
+    assert first.account.equity == pytest.approx(9000.0 + amount * 60.0, rel=1e-12)
+    assert not any("Could not get a price" in m for m in s.step_at(5).messages)   # once per run
+    # A missing price for another symbol never blocks Start.
+    messages = s.engine.start()
+    assert any("Could not get a price for the open BTC/USDT" in m for m in messages)
+
+
+# --------------------------------------------------------------------------- failed poll valuation
+def test_failed_poll_values_positions_at_last_known_price_not_cost(make):
+    s = make(FLAT, price=100.0)
+    _open_position(s)
+    s.engine.start()
+    s.feed.price = 60.0
+    ok = s.step_at(5)
+    s.feed.error = DataFeedError("Network problem talking to binance: timeout")
+    failed = s.step_at(5)
+    assert failed.error is not None
+    assert failed.account.equity == pytest.approx(ok.account.equity, rel=1e-15)
+    assert failed.account.total_pnl < 0
+
+
+# --------------------------------------------------------------------------- too little history
+def test_too_few_candles_for_slow_sma_is_reported_as_error(make):
+    # Like OKX/Coinbase capping candles at 300: the feed returns fewer than the strategy needs.
+    s = make(BUY_THEN_SELL, price=20.0, fast_period=2, slow_period=10, history_limit=12)
+    s.engine.start()
+    for n in (5, 6, 7, 8):
+        result = s.step_at(n)
+        assert result.error is not None and "Not enough candle history" in result.error
+        assert "slow SMA of 10 needs 11" in result.error
+        assert "New candle closed: no crossover" not in result.messages

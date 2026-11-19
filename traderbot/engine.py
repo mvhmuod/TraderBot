@@ -6,10 +6,11 @@ ever place a real order.
 
 What one step does, in this order:
 1. Stop early if the bot halted itself (daily loss limit).
-2. Load the latest CLOSED candles and the last price.
+2. Load the latest CLOSED candles and the last price (plus a price for every other
+   open position, e.g. one left over from a different trading pair).
 3. Remember the account equity at the start of the UTC day (once per day).
-4. Exit an open position if the stop-loss or take-profit price was reached.
-5. If the daily loss limit is reached: close the position and halt.
+4. Exit any open position whose stop-loss or take-profit price was reached.
+5. If the daily loss limit is reached: close every open position and halt.
 6. If a NEW candle has closed since the last step, act on the crossover signal.
 7. Report candles, price, account and trades back to the caller (the GUI).
 """
@@ -96,6 +97,8 @@ class BotEngine:
         # Per-run state (reset by start()).
         self._last_processed_ts: int | None = None
         self._halted = False
+        # Other symbols whose price could not be fetched (reported once per run, not every poll).
+        self._unpriced: set[str] = set()
 
     def _build_strategy(self) -> MACrossoverStrategy | None:
         try:
@@ -124,17 +127,22 @@ class BotEngine:
         risk = RiskManager(cfg)
 
         # Refuse to start if the daily loss limit was already hit today.
+        messages: list[str] = []
         if cfg.max_daily_loss_pct > 0:
             now = int(self._clock())
             day_start = self._storage.get_meta(utc_day_key(now))
             if day_start is not None:
                 day_start = float(day_start)
                 mark_prices: dict[str, float] = {}
-                try:
-                    for symbol in self._broker.positions():
-                        mark_prices[symbol] = self._feed.fetch_last_price(symbol)
-                except DataFeedError as e:
-                    raise EngineError(f"Could not check the daily loss limit: {e}") from e
+                if self._broker.get_position(cfg.symbol) is not None:
+                    try:
+                        mark_prices[cfg.symbol] = self._feed.fetch_last_price(cfg.symbol)
+                    except DataFeedError as e:
+                        raise EngineError(f"Could not check the daily loss limit: {e}") from e
+                # Positions in other symbols are valued exactly as step() values them.
+                _fresh, problems = self._mark_other_positions(mark_prices)
+                messages.extend(self._unpriced_message(sym, err, mark_prices)
+                                for sym, err in problems.items())
                 equity = self._broker.equity(mark_prices)
                 if risk.daily_limit_hit(day_start, equity):
                     raise EngineError(
@@ -149,11 +157,12 @@ class BotEngine:
         self._broker.set_costs(cfg.fee_rate, cfg.slippage_rate)
         self._last_processed_ts = None
         self._halted = False
+        self._unpriced = set()
 
         message = (f"Started paper trading {cfg.symbol} on {cfg.exchange_id} ({cfg.timeframe} candles, "
                    f"SMA {cfg.fast_period}/{cfg.slow_period}, simulated orders only)")
         logger.info(message)
-        return [message]
+        return [message, *messages]
 
     # ------------------------------------------------------------------- step
     def step(self) -> StepResult:
@@ -174,7 +183,7 @@ class BotEngine:
             logger.exception("Unexpected error during step")
             result.error = f"Unexpected error: {e}"
             try:
-                result.account = self._broker.snapshot(mark_prices)
+                result.account = self._broker.snapshot({**self._broker.known_marks(), **mark_prices})
             except Exception:  # noqa: BLE001
                 logger.exception("Could not read the account after an error")
         return result
@@ -187,7 +196,7 @@ class BotEngine:
         if strategy is None:
             # Only possible when step() is called without a successful start().
             result.error = "Invalid moving-average settings: fast SMA must be at least 1 and below slow SMA"
-            result.account = self._broker.snapshot({})
+            result.account = self._broker.snapshot(self._broker.known_marks())
             return
 
         # 2. Market data (closed candles only) and the latest price.
@@ -197,12 +206,33 @@ class BotEngine:
             last_price = self._feed.fetch_last_price(symbol)
         except DataFeedError as e:
             result.error = str(e)
-            result.account = self._broker.snapshot({})
+            # Value positions at their last known prices, not at cost, so the equity shown
+            # does not jump to break-even just because one poll failed.
+            result.account = self._broker.snapshot(self._broker.known_marks())
             return   # the bot keeps running; the next step tries again
         candles = strategy.compute(candles)
+        if len(candles) < strategy.min_candles:
+            # E.g. OKX/Coinbase return at most 300 candles: a long slow SMA can never be computed.
+            result.error = (
+                f"Not enough candle history: {cfg.exchange_id} returned {len(candles)} closed "
+                f"{cfg.timeframe} candles for {symbol}, but a slow SMA of {cfg.slow_period} needs "
+                f"{strategy.min_candles}. The bot cannot trade; choose a smaller Slow SMA "
+                "(or wait until more candles exist)."
+            )
+
+        # Prices for every open position: this symbol's last price, plus a live price for
+        # positions left in other symbols (so they are valued and protected too).
+        mark_prices[symbol] = last_price
+        fresh, problems = self._mark_other_positions(mark_prices)
+        for sym in list(self._unpriced):
+            if sym in fresh or self._broker.get_position(sym) is None:
+                self._unpriced.discard(sym)
+        for sym, err in problems.items():
+            if sym not in self._unpriced:
+                self._unpriced.add(sym)
+                result.messages.append(self._unpriced_message(sym, err, mark_prices))
 
         # 3. Equity at the start of the UTC day (stored once per day).
-        mark_prices[symbol] = last_price
         day_key = utc_day_key(now)
         day_start = self._storage.get_meta(day_key)
         if day_start is None:
@@ -211,18 +241,22 @@ class BotEngine:
             result.messages.append(f"Equity at the start of the UTC day: {_fmt_money(day_start)}")
         day_start = float(day_start)
 
-        # 4. Stop-loss / take-profit.
-        position = self._broker.get_position(symbol)
-        if position is not None:
-            reason = self._risk.exit_reason(position, last_price)
+        # 4. Stop-loss / take-profit for every open position that has a live price.
+        for sym, position in self._broker.positions().items():
+            if sym not in fresh:
+                continue
+            reason = self._risk.exit_reason(position, mark_prices[sym])
             if reason is not None:
-                self._close(result, symbol, last_price, now, reason)
+                self._close(result, sym, mark_prices[sym], now, reason)
 
-        # 5. Daily loss limit: close everything for this symbol and halt.
+        # 5. Daily loss limit: close every open position and halt.
         equity = self._broker.equity(mark_prices)
         if self._risk.daily_limit_hit(day_start, equity):
-            if self._broker.get_position(symbol) is not None:
-                self._close(result, symbol, last_price, now, TradeReason.DAILY_LIMIT)
+            for sym in self._broker.positions():
+                if sym in fresh:
+                    self._close(result, sym, mark_prices[sym], now, TradeReason.DAILY_LIMIT)
+                else:
+                    result.messages.append(f"Could not close {sym}: no current price")
             self._halted = True
             result.halted = True
             result.messages.append(
@@ -279,10 +313,41 @@ class BotEngine:
                 result.messages.append("Sell signal ignored: nothing to sell")
                 return
             self._close(result, symbol, last_price, now, TradeReason.SIGNAL)
-        else:
+        elif len(candles) >= strategy.min_candles:
+            # (With too little history the step already reports an error instead.)
             result.messages.append("New candle closed: no crossover")
 
     # ---------------------------------------------------------------- helpers
+    def _mark_other_positions(self, mark_prices: dict[str, float]) -> tuple[set[str], dict[str, str]]:
+        """Add a live price to ``mark_prices`` for every open position that has none yet.
+
+        A position whose price cannot be fetched is valued at its last known price (or, if
+        none is known, at its average cost) and is not traded on. Returns the symbols that
+        have a live price now and ``{symbol: problem}`` for the ones that do not. The live
+        prices are remembered by the broker for later failed polls.
+        """
+        fresh = set(mark_prices)
+        problems: dict[str, str] = {}
+        known = self._broker.known_marks()
+        for sym in self._broker.positions():
+            if sym in mark_prices:
+                continue
+            try:
+                mark_prices[sym] = self._feed.fetch_last_price(sym)
+                fresh.add(sym)
+            except DataFeedError as e:
+                problems[sym] = str(e)
+                if sym in known:
+                    mark_prices[sym] = known[sym]
+        self._broker.remember_marks({sym: mark_prices[sym] for sym in fresh})
+        return fresh, problems
+
+    @staticmethod
+    def _unpriced_message(symbol: str, error: str, mark_prices: dict[str, float]) -> str:
+        valued = "its last known price" if symbol in mark_prices else "its average cost"
+        return (f"Could not get a price for the open {symbol} position ({error}). It is valued at "
+                f"{valued} and its stop-loss/take-profit cannot be checked.")
+
     def _close(self, result: StepResult, symbol: str, price: float, now: int, reason: TradeReason) -> None:
         """Sell the whole position; an order problem becomes a message + result.error."""
         try:

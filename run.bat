@@ -10,7 +10,8 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 ".venv\Scripts\python.exe" app.py
-if errorlevel 1 (
+rem Compare with 0, not "if errorlevel 1": a native crash gives a NEGATIVE exit code.
+if not "%errorlevel%"=="0" (
     echo.
     echo TraderBot closed with an error. See the messages above.
     pause

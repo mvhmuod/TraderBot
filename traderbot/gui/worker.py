@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QLockFile, QObject, QTimer, Signal, Slot
 
 from traderbot.broker.paper import PaperBroker
 from traderbot.config import MIN_ORDER_QUOTE, BotConfig
@@ -66,8 +66,32 @@ class EngineWorker(QObject):
         self._timer: QTimer | None = None
         self._running = False
         self._stepping = False
+        self._db_lock: QLockFile | None = None
 
     # ------------------------------------------------------------------ helpers
+    def _lock_database(self, db_path: str) -> bool:
+        """Take the lock file next to the database; False if another TraderBot holds it.
+
+        Two app instances on one database would each keep their own copy of the cash
+        balance and overwrite each other's fills, so only one may open it at a time.
+        """
+        self._unlock_database()
+        if db_path == ":memory:":
+            return True
+        path = Path(db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = QLockFile(str(path) + ".lock")
+        lock.setStaleLockTime(0)   # a lock from a crashed (no longer running) app is still removed
+        if not lock.tryLock(0):
+            return False
+        self._db_lock = lock
+        return True
+
+    def _unlock_database(self) -> None:
+        if self._db_lock is not None:
+            self._db_lock.unlock()
+            self._db_lock = None
+
     def _get_feed(self, exchange_id: str) -> MarketDataFeed:
         """One MarketDataFeed per exchange id, created on first use (may raise DataFeedError)."""
         feed = self._feeds.get(exchange_id)
@@ -102,6 +126,16 @@ class EngineWorker(QObject):
         try:
             if self._storage is not None:
                 self._storage.close()
+                self._storage = None
+            if not self._lock_database(db_path):
+                self._broker = None
+                self.error.emit(
+                    f"TraderBot is already running with this paper account ({Path(db_path).name}). "
+                    "Close the other TraderBot window first: two copies at once would corrupt "
+                    "the paper account."
+                )
+                self.initialized.emit(False)
+                return
             self._storage = Storage(db_path)
             saved = self._storage.load_settings()
             config = BotConfig.from_dict(saved) if saved else BotConfig()
@@ -121,6 +155,7 @@ class EngineWorker(QObject):
                     logger.exception("Error while closing the database")
             self._storage = None
             self._broker = None
+            self._unlock_database()
             self.error.emit(f"Could not open the paper account database: {exc}")
             self.initialized.emit(False)
 
@@ -213,7 +248,8 @@ class EngineWorker(QObject):
                 result.candles = strategy.compute(candles)
                 result.last_price = last_price
                 if self._broker is not None:
-                    result.account = self._broker.snapshot({config.symbol: last_price})
+                    result.account = self._broker.snapshot(
+                        self._preview_marks(feed, config.symbol, last_price))
         except (DataFeedError, ValueError) as exc:
             result.error = str(exc)
         except Exception as exc:  # noqa: BLE001
@@ -222,6 +258,24 @@ class EngineWorker(QObject):
         self.preview_ready.emit(result)
         if result.account is not None:
             self.account_changed.emit(result.account)
+
+    def _preview_marks(self, feed: MarketDataFeed, symbol: str, last_price: float) -> dict[str, float]:
+        """Prices for the preview's account snapshot: every open position at its latest price.
+
+        Positions in other symbols get a live price when the feed has one, otherwise their
+        last known price (or, if none is known, their average cost).
+        """
+        fresh = {symbol: last_price}
+        if self._broker is None:
+            return fresh
+        for other in self._broker.positions():
+            if other not in fresh:
+                try:
+                    fresh[other] = feed.fetch_last_price(other)
+                except DataFeedError:
+                    pass
+        self._broker.remember_marks(fresh)
+        return {**self._broker.known_marks(), **fresh}
 
     @Slot(float)
     def reset_account(self, starting_balance: float) -> None:
@@ -276,6 +330,7 @@ class EngineWorker(QObject):
                 logger.exception("Error while closing the database")
         self._storage = None
         self._broker = None
+        self._unlock_database()
         self._feeds.clear()
         # End the worker thread's event loop from inside the thread, so this always happens
         # AFTER every request that was queued before shutdown. Never quit the GUI thread.

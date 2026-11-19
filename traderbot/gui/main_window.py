@@ -878,7 +878,8 @@ class MainWindow(QMainWindow):
             return
         self.cash_card.set_value(format_money(account.cash))
         self.equity_card.set_value(format_money(account.equity),
-                                   tooltip="Cash plus open positions at the last price.")
+                                   tooltip="Cash plus open positions at the last known price "
+                                           "(at average cost until a price is known).")
         total = account.total_pnl
         self.total_pnl_card.set_value(
             f"{format_money(total, signed=True)} ({account.total_pnl_pct:+.2f}%)", pnl_color(total),
@@ -912,7 +913,10 @@ class MainWindow(QMainWindow):
         table = self.positions_table
         table.setRowCount(len(positions))
         for row, pos in enumerate(positions):
-            last = self._last_price if pos.symbol == self._last_price_symbol else None
+            if pos.symbol == self._last_price_symbol:
+                last = self._last_price
+            else:   # e.g. a position left over from another pair: the price the engine used
+                last = self._account.mark_prices.get(pos.symbol) if self._account is not None else None
             value = pos.amount * last if last is not None else None
             unrealized = (value - pos.amount * pos.avg_cost) if value is not None else None
             table.setItem(row, 0, self._cell(pos.symbol, _LEFT))

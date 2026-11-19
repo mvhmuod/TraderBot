@@ -64,6 +64,9 @@ class PaperBroker:
         self._storage = storage
         self._fee_rate = _check_rate("Fee rate", fee_rate)
         self._slippage_rate = _check_rate("Slippage rate", slippage_rate)
+        # Latest market price seen per symbol. Used to value positions when a fresh price
+        # is missing (e.g. a failed poll), instead of falling back to the average cost.
+        self._known_marks: dict[str, float] = {}
         with self._lock:
             if storage.load_account() is None:
                 storage.reset_account(starting_balance)
@@ -120,6 +123,19 @@ class PaperBroker:
                 total += pos.amount * mark_prices.get(symbol, pos.avg_cost)
             return total
 
+    def remember_marks(self, mark_prices: dict[str, float]) -> None:
+        """Remember these market prices as the latest known price of each symbol."""
+        with self._lock:
+            for symbol, price in mark_prices.items():
+                value = float(price)
+                if math.isfinite(value) and value > 0:
+                    self._known_marks[symbol] = value
+
+    def known_marks(self) -> dict[str, float]:
+        """Return a copy of the latest known market price per symbol (see ``remember_marks``)."""
+        with self._lock:
+            return dict(self._known_marks)
+
     def snapshot(self, mark_prices: dict[str, float]) -> AccountSnapshot:
         """Return a read-only copy of the account (safe to hand to the GUI thread)."""
         with self._lock:
@@ -129,6 +145,8 @@ class PaperBroker:
                 positions=dict(self._positions),
                 equity=self.equity(mark_prices),
                 realized_pnl_total=self._storage.realized_pnl_total(),
+                mark_prices={symbol: float(mark_prices[symbol])
+                             for symbol in self._positions if symbol in mark_prices},
             )
 
     # ----------------------------------------------------------------- orders

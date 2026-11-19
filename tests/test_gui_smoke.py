@@ -23,7 +23,9 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from traderbot.gui.chart import PriceChart, format_price
 from traderbot.gui.main_window import MainWindow, format_amount, format_money
+from traderbot.broker.paper import PaperBroker
 from traderbot.models import CANDLE_COLUMNS, Side, Trade, TradeReason
+from traderbot.storage import Storage
 
 MINUTE_MS = 60_000
 
@@ -247,6 +249,50 @@ def test_settings_persist_and_invalid_settings_do_not_start(qapp: QApplication, 
     assert window2.fast_spin.value() == 10
     assert window2.timeframe_combo.currentText() == "15m"
     close_window(window2)
+    assert problems == []
+
+
+def test_second_window_on_same_database_is_refused(qapp: QApplication, tmp_path: Path,
+                                                  problems: list[str]) -> None:
+    # Two app instances on one database would overwrite each other's cash balance.
+    feed = FakeFeed("binance")
+    window = make_window(tmp_path, feed)
+    second = MainWindow(db_path=str(tmp_path / "traderbot_test.db"), feed_factory=lambda _id: feed)
+    try:
+        second.show()
+        assert wait_until(lambda: second.status_label.text() == "Error", 10), "second window opened the db"
+        assert not second.is_ready and not second.start_button.isEnabled()
+        boxes = [w for w in second.findChildren(QMessageBox) if w.isVisible()]
+        assert boxes and "already running" in boxes[0].text()
+        for box in boxes:
+            box.close()
+        assert window.is_ready
+    finally:
+        close_window(second)
+        close_window(window)
+    # Once the first window is closed the database can be opened again.
+    third = make_window(tmp_path, feed)
+    close_window(third)
+    assert problems == []
+
+
+def test_position_in_other_pair_is_valued_at_market_on_startup(qapp: QApplication, tmp_path: Path,
+                                                               problems: list[str]) -> None:
+    storage = Storage(str(tmp_path / "traderbot_test.db"))
+    broker = PaperBroker(storage, 0.0, 0.0, 10_000.0)
+    broker.market_buy("ETH/USDT", 1000.0, 50.0, 1_700_000_000_000, TradeReason.SIGNAL)   # 20 ETH
+    storage.close()
+
+    feed = FakeFeed("binance")          # last price 80.5 for every symbol; the window shows BTC/USDT
+    window = make_window(tmp_path, feed)
+    try:
+        expected_equity = 9000.0 + 20.0 * 80.5
+        assert wait_until(lambda: window.equity_card.value.text() == format_money(expected_equity), 10)
+        assert window.positions_table.item(0, 0).text() == "ETH/USDT"
+        assert window.positions_table.item(0, 3).text() == format_price(80.5)
+        assert window.positions_table.item(0, 4).text() == format_money(20.0 * 80.5)
+    finally:
+        close_window(window)
     assert problems == []
 
 

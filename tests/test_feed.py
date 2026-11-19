@@ -5,7 +5,7 @@ import ccxt
 import pandas as pd
 import pytest
 
-from traderbot.data.feed import DataFeedError, MarketDataFeed, timeframe_to_ms
+from traderbot.data.feed import CLOSE_GRACE_MS, DataFeedError, MarketDataFeed, timeframe_to_ms
 from traderbot.models import CANDLE_COLUMNS
 
 MIN = 60_000  # one minute in ms
@@ -110,9 +110,43 @@ def test_forming_candle_boundary_exact():
     df = feed.fetch_closed_candles("BTC/USDT", "5m", limit=10, now_ms=T0 - 1)
     assert df["timestamp"].tolist() == [T0 - 3 * tf, T0 - 2 * tf]
 
-    # Exactly when candle T0 closes it becomes closed too.
+    # Candle T0 is the newest row and no newer candle exists yet: it only counts as closed
+    # CLOSE_GRACE_MS after its close time (the local clock may run ahead of the exchange).
     df = feed.fetch_closed_candles("BTC/USDT", "5m", limit=10, now_ms=T0 + tf)
+    assert df["timestamp"].tolist() == [T0 - 3 * tf, T0 - 2 * tf, T0 - tf]
+    df = feed.fetch_closed_candles("BTC/USDT", "5m", limit=10, now_ms=T0 + tf + CLOSE_GRACE_MS)
     assert df["timestamp"].tolist() == [T0 - 3 * tf, T0 - 2 * tf, T0 - tf, T0]
+
+
+def test_newest_candle_not_trusted_when_local_clock_runs_ahead():
+    # The PC clock is 2 s ahead: 1.5 s before candle T0 really closes, the exchange still
+    # returns it as the newest (forming) row, but the local clock says it has closed.
+    tf = MIN
+    rows = [candle(T0 - 2 * tf, 10.0), candle(T0 - tf, 10.0), candle(T0, 20.0)]
+    feed = MarketDataFeed("fake", exchange=FakeExchange(ohlcv=rows))
+    df = feed.fetch_closed_candles("BTC/USDT", "1m", limit=10, now_ms=T0 + tf + 500)
+    assert df["timestamp"].tolist() == [T0 - 2 * tf, T0 - tf]
+    # Once the exchange has started the next candle, candle T0 is final.
+    rows[-1] = candle(T0, 10.0)
+    rows.append(candle(T0 + tf, 10.0))
+    df = feed.fetch_closed_candles("BTC/USDT", "1m", limit=10, now_ms=T0 + tf + 500)
+    assert df["timestamp"].tolist() == [T0 - 2 * tf, T0 - tf, T0]
+    assert df["close"].tolist() == [10.0, 10.0, 10.0]
+
+
+def test_timeframe_the_exchange_does_not_offer_is_a_clear_error():
+    fake = FakeExchange(ohlcv=[candle(T0 - MIN)])
+    fake.timeframes = {"1m": "ONE_MINUTE", "1h": "ONE_HOUR", "6h": "SIX_HOUR"}   # like coinbase
+    feed = MarketDataFeed("coinbase", exchange=fake)
+    with pytest.raises(DataFeedError, match="coinbase does not offer 4h candles"):
+        feed.fetch_closed_candles("BTC/USDT", "4h", limit=5, now_ms=T0)
+    assert fake.ohlcv_calls == []
+    assert len(feed.fetch_closed_candles("BTC/USDT", "1m", limit=5, now_ms=T0 + CLOSE_GRACE_MS)) == 1
+
+
+def test_real_coinbase_has_no_4h_timeframe():
+    # Documents why the check above matters (ccxt metadata only, no network).
+    assert "4h" not in ccxt.coinbase().timeframes
 
 
 def test_now_defaults_to_exchange_milliseconds():
@@ -141,7 +175,7 @@ def test_duplicates_and_unsorted_rows():
         candle(T0 - 2 * tf, 102.0),
     ]
     feed = MarketDataFeed("fake", exchange=FakeExchange(ohlcv=rows))
-    df = feed.fetch_closed_candles("BTC/USDT", "1m", limit=10, now_ms=T0)
+    df = feed.fetch_closed_candles("BTC/USDT", "1m", limit=10, now_ms=T0 + CLOSE_GRACE_MS)
     assert df["timestamp"].tolist() == [T0 - 3 * tf, T0 - 2 * tf, T0 - tf]
     assert df["timestamp"].is_unique
     assert df["close"].tolist() == [101.5, 102.0, 103.0]
@@ -161,7 +195,7 @@ def test_limit_trims_to_newest_rows_after_dropping_forming():
 def test_dtypes_and_columns():
     rows = [[T0 - MIN, 1, 2, 0, 1, 5], [T0 - 2 * MIN, "1.5", 2.5, 0.5, 2, None]]
     feed = MarketDataFeed("fake", exchange=FakeExchange(ohlcv=rows))
-    df = feed.fetch_closed_candles("BTC/USDT", "1m", limit=5, now_ms=T0)
+    df = feed.fetch_closed_candles("BTC/USDT", "1m", limit=5, now_ms=T0 + CLOSE_GRACE_MS)
     assert list(df.columns) == CANDLE_COLUMNS
     assert df["timestamp"].dtype == "int64"
     for col in CANDLE_COLUMNS[1:]:

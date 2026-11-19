@@ -21,7 +21,7 @@ positions, trade history and a log. It is a learning and testing project.
 
 - Live public market data from Binance, Kraken, Coinbase, Bybit or OKX (no account needed).
 - Any spot trading pair the exchange lists (searchable list, or type the pair yourself).
-- Timeframes: 1m, 5m, 15m, 30m, 1h, 4h, 1d.
+- Timeframes: 1m, 5m, 15m, 30m, 1h, 4h, 1d (Coinbase does not offer 4h candles).
 - SMA crossover strategy with adjustable fast and slow lengths.
 - Simulated fills with a configurable fee and slippage.
 - Optional stop-loss, take-profit and daily loss limit (each can be switched off).
@@ -60,13 +60,24 @@ Double-click `run.bat`, or run:
 
 Pick the exchange, trading pair, timeframe and other settings on the left, then press **Start**.
 Press **Stop** to stop the bot. Open positions are kept when you stop, and the bot continues
-with them the next time you start it.
+with them the next time you start it. If you switch to another trading pair while a position is
+open, the bot keeps valuing that position at its latest price and still applies the stop-loss,
+take-profit and daily loss limit to it, but it only buys and sells on crossover signals for the
+selected pair.
+
+Only one TraderBot window can use the paper account at a time. If TraderBot is already running
+(or an old window is still shutting down), a second copy shows "TraderBot is already running"
+and does not open the account.
 
 ## How it works
 
 1. **Closed candles only.** Every poll (every *Poll interval* seconds) the bot downloads recent
    candles and drops any candle that is still forming. The strategy only ever looks at candles
-   that have closed, so signals do not flicker.
+   that have closed, so signals do not flicker. Because the PC clock can run a few seconds ahead
+   of the exchange, the newest candle is only treated as closed once the exchange has started the
+   next candle, or 10 seconds after its close time. If the exchange returns fewer closed candles
+   than the slow SMA needs, the status shows an error ("Not enough candle history") and the bot
+   cannot trade until you choose a smaller *Slow SMA*.
 2. **The first candle after Start is only observed.** When you press Start, the newest closed
    candle already existed before the bot was watching, so its signal is never traded. The bot
    waits for the next candle to close.
@@ -83,13 +94,18 @@ with them the next time you start it.
    the order value and is taken from the money spent (buy) or received (sell).
 6. **Average cost includes fees.** The average cost of a position is everything paid for it,
    fees included, divided by the amount held. It is the break-even price.
-7. **Stop-loss and take-profit.** On every poll, if a position is open, the latest price is
-   compared with the average cost. The position is sold if the price is *Stop-loss* % or more
-   below it, or *Take-profit* % or more above it.
+7. **Stop-loss and take-profit.** On every poll, for every open position (also one in a pair
+   other than the selected one), the latest price is compared with the average cost. The position
+   is sold if the price is *Stop-loss* % or more below it, or *Take-profit* % or more above it.
+   If no current price can be fetched for a position, it is not sold, and the log says so.
 8. **Daily loss limit.** The bot records the account equity (cash plus positions at the latest
    price) at its first poll of each UTC day. If equity falls by *Daily loss limit* % or more from
-   that value, the bot sells the position and halts. Pressing Start again on the same UTC day is
-   refused while equity is still at or below that limit.
+   that value, the bot sells every open position and halts. Pressing Start again on the same UTC
+   day is refused while equity is still at or below that limit.
+9. **Equity when a price is missing.** When a poll fails (for example a network problem), equity
+   and Total P&L keep using the last known price of each position. A position is valued at its
+   average cost only while no price for it has been seen yet (for example right after the app
+   starts).
 
 ## Settings
 
@@ -97,9 +113,9 @@ with them the next time you start it.
 | --- | --- | --- |
 | Exchange | binance | Where public market data comes from. |
 | Trading pair | BTC/USDT | The pair to paper-trade, written as BASE/QUOTE. |
-| Timeframe | 5m | Candle length. The bot acts at most once per closed candle. |
+| Timeframe | 5m | Candle length. The bot acts at most once per closed candle. Coinbase does not offer 4h. |
 | Fast SMA | 9 | Number of candles in the fast moving average (1 to 500). |
-| Slow SMA | 21 | Number of candles in the slow moving average (2 to 500, larger than the fast one). |
+| Slow SMA | 21 | Number of candles in the slow moving average (2 to 500, larger than the fast one). OKX and Coinbase return at most 300 candles, so there it can be at most 298. |
 | Position size | 10 % | Share of equity used for each buy, limited by available cash. |
 | Stop-loss | Off (0) | Sell if the price falls this % below the average cost. |
 | Take-profit | Off (0) | Sell if the price rises this % above the average cost. |
@@ -111,7 +127,8 @@ with them the next time you start it.
 
 All settings are locked while the bot is running. They are saved when the bot starts and when
 the window closes. Data is stored in `data/traderbot.db`, which stays on your computer and is
-not part of the repository.
+not part of the repository. While the app is open it also keeps a lock file,
+`data/traderbot.db.lock`, so that a second copy of the app cannot use the same account.
 
 ## Running tests
 
@@ -119,7 +136,8 @@ not part of the repository.
 .venv\Scripts\python -m pytest -q
 ```
 
-The tests use fake market data and temporary databases; they do not access the network.
+The tests use fake market data and temporary databases; they do not access the network. The
+`run.bat` tests start a copy of the launcher with a stand-in for the app.
 
 ## Project structure
 

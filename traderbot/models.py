@@ -67,6 +67,8 @@ class AccountSnapshot:
     positions: dict[str, Position]      # symbol -> position
     equity: float                       # cash + positions valued at mark prices
     realized_pnl_total: float           # sum of realized_pnl over all trades
+    # Price used to value each open position in ``equity`` (positions missing here are at avg_cost).
+    mark_prices: dict[str, float] = field(default_factory=dict)
 
     @property
     def total_pnl(self) -> float:
