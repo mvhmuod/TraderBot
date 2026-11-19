@@ -1,0 +1,10 @@
+# TraderBot dependencies (exact versions the project was built and tested with).
+# Install inside the project's virtual environment with:
+#   pip install --only-binary=:all: -r requirements.txt
+# (--only-binary=:all: uses pre-built wheels only, so no compiler is needed.)
+PySide6==6.12.0
+pyqtgraph==0.14.0
+ccxt==4.5.64
+pandas==3.1.1
+numpy==2.5.5
+pytest==9.2.0

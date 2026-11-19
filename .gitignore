@@ -1,0 +1,40 @@
+# --- Private / local-only files: never commit these ---
+# Python virtual environment (installed libraries)
+.venv/
+venv/
+env/
+
+# Paper account database, saved settings and logs (your local data)
+/data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+settings.json
+
+# Secrets (API keys, tokens) - this bot uses none, but just in case
+.env
+.env.*
+*.key
+*.pem
+secrets*
+credentials*
+
+# Local tool / editor settings
+.claude/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Python build and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
