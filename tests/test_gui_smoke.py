@@ -296,6 +296,61 @@ def test_position_in_other_pair_is_valued_at_market_on_startup(qapp: QApplicatio
     assert problems == []
 
 
+def test_pair_in_other_currency_offers_reset(qapp: QApplication, tmp_path: Path,
+                                             problems: list[str]) -> None:
+    # A USDT account with one trade; the user then picks ETH/BTC (priced in BTC).
+    storage = Storage(str(tmp_path / "traderbot_test.db"))
+    broker = PaperBroker(storage, 0.0, 0.0, 10_000.0)
+    broker.set_currency("USDT")
+    broker.market_buy("ETH/USDT", 1000.0, 50.0, 1_700_000_000_000, TradeReason.SIGNAL)
+    storage.close()
+
+    feed = FakeFeed("binance")
+    window = make_window(tmp_path, feed)
+    try:
+        configure_fast_bot(window)
+        window.pair_combo.setEditText("ETH/BTC")
+        asked: list[str] = []
+        answer = {"value": False}
+
+        def confirm(title: str, text: str) -> bool:
+            asked.append(text)
+            return answer["value"]
+
+        window._confirm = confirm  # type: ignore[method-assign]
+
+        # 1) Start is refused and a reset is offered; answering No changes nothing.
+        window.start_button.click()
+        assert wait_until(lambda: len(asked) == 1, 10), "no reset offer"
+        assert "This paper account is in USDT, but ETH/BTC is priced in BTC" in asked[0]
+        assert "10,000.00 BTC" in asked[0]
+        assert not window.is_running and window.status_label.text() == "Error"
+        assert window.start_button.isEnabled()
+        assert wait_until(lambda: window.positions_table.rowCount() == 1, 5)
+        # No plain error box on top of the question.
+        assert not [w for w in window.findChildren(QMessageBox) if w.isVisible()]
+
+        # 2) Answering Yes resets the account in BTC; Start then works.
+        answer["value"] = True
+        window.start_button.click()
+        assert wait_until(lambda: len(asked) == 2, 10)
+        assert wait_until(lambda: window.positions_table.rowCount() == 0
+                          and window.trades_table.rowCount() == 0, 10), "account not reset"
+        assert wait_until(lambda: "10,000.00 BTC" in window.log_view.toPlainText(), 10)
+        window.start_button.click()
+        assert wait_until(lambda: window.is_running, 10), "bot did not start after reset"
+        assert len(asked) == 2
+        window.stop_button.click()
+        assert wait_until(lambda: not window.is_running, 10)
+    finally:
+        close_window(window)
+
+    check = Storage(str(tmp_path / "traderbot_test.db"))
+    assert PaperBroker(check, 0.0, 0.0, 1.0).currency == "BTC"
+    check.close()
+    assert problems == []
+
+
 # ---------------------------------------------------------------------- PriceChart unit tests
 def _candles_with_ma(n: int = 30) -> pd.DataFrame:
     start = 1_700_000_000_000

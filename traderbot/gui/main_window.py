@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from traderbot.config import (
     DEFAULT_DB_PATH, MAX_MA_PERIOD, MIN_ORDER_QUOTE, MIN_POLL_SECONDS, SUPPORTED_EXCHANGES,
-    SUPPORTED_TIMEFRAMES, BotConfig,
+    SUPPORTED_TIMEFRAMES, BotConfig, quote_currency,
 )
 from traderbot.data.feed import MarketDataFeed
 from traderbot.gui.chart import PriceChart, format_price
@@ -162,7 +162,7 @@ class MainWindow(QMainWindow):
     _request_stop = Signal()
     _request_symbols = Signal(str)
     _request_preview = Signal(object)
-    _request_reset = Signal(float)
+    _request_reset = Signal(float, str)   # starting balance, currency ("" = decide on next start)
     _request_save_settings = Signal(object)
     _request_shutdown = Signal()
 
@@ -247,6 +247,7 @@ class MainWindow(QMainWindow):
         self.worker.started.connect(self._on_started, queued)
         self.worker.stopped.connect(self._on_stopped, queued)
         self.worker.error.connect(self._on_error, queued)
+        self.worker.currency_mismatch.connect(self._on_currency_mismatch, queued)
         self.worker.log.connect(self._append_log, queued)
 
         app = QApplication.instance()
@@ -701,11 +702,14 @@ class MainWindow(QMainWindow):
         if not self._ready or self._running or self._starting or self._stopping:
             return
         balance = self.balance_spin.value()
+        # The fresh account's cash is in the currency of the selected pair.
+        currency = quote_currency(self._current_symbol_text())
+        amount_text = f"{format_money(balance)} {currency}".rstrip()
         if self._confirm(
                 "Reset paper account",
                 f"Delete all paper trades and positions and start again with "
-                f"{format_money(balance)}?\n\nThis cannot be undone."):
-            self._request_reset.emit(float(balance))
+                f"{amount_text}?\n\nThis cannot be undone."):
+            self._request_reset.emit(float(balance), currency)
 
     @Slot(str)
     def _on_exchange_changed(self, exchange_id: str) -> None:
@@ -816,6 +820,24 @@ class MainWindow(QMainWindow):
         else:
             self._set_status("Stopped", reason)
         self._update_controls()
+
+    @Slot(str, str, str)
+    def _on_currency_mismatch(self, account_currency: str, pair_currency: str, message: str) -> None:
+        """Start was refused: the pair's currency differs from the account's. Offer a reset."""
+        if self._close_pending or self._shutdown_complete or not self._ready:
+            return
+        if self._running or self._starting or self._stopping:
+            return
+        if not pair_currency:
+            self._show_message(QMessageBox.Icon.Warning, "TraderBot", message)
+            return   # never reset into "no currency"
+        balance = self.balance_spin.value()
+        if self._confirm(
+                "Different currency",
+                f"{message}\n\nReset the paper account now? This deletes all paper trades and "
+                f"positions and starts again with {format_money(balance)} {pair_currency}.\n\n"
+                "This cannot be undone. Press Start again afterwards."):
+            self._request_reset.emit(float(balance), pair_currency)
 
     @Slot(str)
     def _on_error(self, message: str) -> None:

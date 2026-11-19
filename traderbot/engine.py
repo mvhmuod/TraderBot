@@ -23,7 +23,7 @@ from collections.abc import Callable
 import pandas as pd
 
 from traderbot.broker.paper import BrokerError, PaperBroker
-from traderbot.config import BotConfig
+from traderbot.config import BotConfig, quote_currency
 from traderbot.data.feed import DataFeedError, MarketDataFeed
 from traderbot.models import Side, Signal, StepResult, Trade, TradeReason
 from traderbot.risk import RiskManager, utc_day_key
@@ -45,6 +45,32 @@ _REASON_LABELS = {
 
 class EngineError(Exception):
     """The bot cannot start (message is safe to show to the user)."""
+
+
+class CurrencyMismatchError(EngineError):
+    """The selected pair is priced in a different currency than the paper account's cash.
+
+    ``account_currency`` is the account's currency. For an older account that has none
+    recorded but whose trades/positions use several currencies, it is those currencies
+    joined with ", " and ``mixed`` is True: then only a reset helps.
+    ``pair_currency`` is the currency of the selected pair.
+    """
+
+    def __init__(self, account_currency: str, pair_currency: str, symbol: str,
+                 mixed: bool = False) -> None:
+        self.account_currency = account_currency
+        self.pair_currency = pair_currency
+        self.symbol = symbol
+        self.mixed = mixed
+        if mixed:
+            message = (f"This paper account has trades or positions in more than one currency "
+                       f"({account_currency}), so the bot cannot run on it. Reset the paper "
+                       f"account to start fresh in {pair_currency}.")
+        else:
+            message = (f"This paper account is in {account_currency}, but {symbol} is priced in "
+                       f"{pair_currency}. Choose a pair priced in {account_currency}, or reset "
+                       f"the paper account to start fresh in {pair_currency}.")
+        super().__init__(message)
 
 
 def _fmt_money(value: float) -> str:
@@ -117,12 +143,34 @@ class BotEngine:
 
         Raises EngineError if the settings are invalid, or if today's daily loss
         limit was already reached (the bot must stay off until the next UTC day).
+        Raises CurrencyMismatchError if the pair is priced in a different currency
+        than the paper account's cash.
         """
         errors = self.config.validate()
         if errors:
             raise EngineError("Invalid settings: " + "; ".join(errors))
 
         cfg = self.config
+
+        # Cash has one currency: refuse a pair priced in a different one.
+        pair_currency = quote_currency(cfg.symbol)
+        account_currency = self._broker.currency
+        adopt_currency: str | None = None
+        if account_currency is None:
+            # Account without a recorded currency (new, or made by an older version): its
+            # cash is in the currency of its past trades and open positions, if it has any;
+            # a brand-new account takes the currency of the pair being started.
+            used = {quote_currency(sym) for sym in self._broker.positions()}
+            used |= {quote_currency(sym) for sym in self._storage.trade_symbols()}
+            used.discard("")
+            held = sorted(used)
+            if len(held) > 1:
+                raise CurrencyMismatchError(", ".join(held), pair_currency, cfg.symbol, mixed=True)
+            if held and held[0] != pair_currency:
+                raise CurrencyMismatchError(held[0], pair_currency, cfg.symbol)
+            adopt_currency = pair_currency
+        elif account_currency != pair_currency:
+            raise CurrencyMismatchError(account_currency, pair_currency, cfg.symbol)
         # Rebuild from the (possibly edited) config so this run uses current settings.
         risk = RiskManager(cfg)
 
@@ -158,6 +206,9 @@ class BotEngine:
         self._last_processed_ts = None
         self._halted = False
         self._unpriced = set()
+        if adopt_currency is not None:
+            self._broker.set_currency(adopt_currency)
+            messages.insert(0, f"Paper account currency set to {adopt_currency}.")
 
         message = (f"Started paper trading {cfg.symbol} on {cfg.exchange_id} ({cfg.timeframe} candles, "
                    f"SMA {cfg.fast_period}/{cfg.slow_period}, simulated orders only)")

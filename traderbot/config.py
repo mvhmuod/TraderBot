@@ -19,6 +19,16 @@ MAX_MA_PERIOD = 500
 MIN_POLL_SECONDS = 5        # keep well inside public API rate limits
 
 
+def quote_currency(symbol: str) -> str:
+    """Return the currency a pair is priced in: "ETH/BTC" -> "BTC", "BTC/USDT:USDT" -> "USDT".
+
+    Returns "" when the symbol has no "/" (not a valid pair).
+    """
+    if "/" not in symbol:
+        return ""
+    return symbol.split("/", 1)[1].split(":", 1)[0].strip().upper()
+
+
 @dataclass
 class BotConfig:
     exchange_id: str = "binance"
@@ -41,7 +51,7 @@ class BotConfig:
         errors: list[str] = []
         if self.exchange_id not in SUPPORTED_EXCHANGES:
             errors.append(f"Unsupported exchange: {self.exchange_id!r}")
-        if not self.symbol or "/" not in self.symbol:
+        if not quote_currency(self.symbol) or not self.symbol.split("/", 1)[0].strip():
             errors.append("Trading pair must look like BASE/QUOTE, e.g. BTC/USDT")
         if self.timeframe not in SUPPORTED_TIMEFRAMES:
             errors.append(f"Unsupported timeframe: {self.timeframe!r}")

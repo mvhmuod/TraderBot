@@ -17,7 +17,7 @@ from PySide6.QtCore import QCoreApplication, QLockFile, QObject, QTimer, Signal,
 from traderbot.broker.paper import PaperBroker
 from traderbot.config import MIN_ORDER_QUOTE, BotConfig
 from traderbot.data.feed import DataFeedError, MarketDataFeed
-from traderbot.engine import BotEngine, EngineError
+from traderbot.engine import BotEngine, CurrencyMismatchError, EngineError
 from traderbot.models import StepResult
 from traderbot.storage import Storage
 from traderbot.strategy.ma_cross import MACrossoverStrategy
@@ -55,6 +55,9 @@ class EngineWorker(QObject):
     stopped = Signal(str)               # reason
     error = Signal(str)
     log = Signal(str)
+    # Start refused because the pair's currency differs from the account's:
+    # (account_currency, pair_currency, message). Sent after `stopped`, instead of `error`.
+    currency_mismatch = Signal(str, str, str)
 
     def __init__(self, feed_factory: Callable[[str], MarketDataFeed] | None = None) -> None:
         super().__init__()  # no parent: required for moveToThread
@@ -112,11 +115,14 @@ class EngineWorker(QObject):
         if self._timer is not None:
             self._timer.stop()
 
-    def _fail_start(self, message: str) -> None:
+    def _fail_start(self, message: str, show_error: bool = True) -> None:
         self._running = False
         self._engine = None
         self._stop_timer()
-        self.error.emit(message)
+        if show_error:
+            self.error.emit(message)
+        else:
+            self.log.emit(message)
         self.stopped.emit(f"{STOP_REASON_START_FAILED}: {message}")
 
     # ------------------------------------------------------------------ slots
@@ -144,7 +150,9 @@ class EngineWorker(QObject):
             self.settings_loaded.emit(config.to_dict())
             self.account_changed.emit(self._broker.snapshot({}))
             self.trades_loaded.emit(self._storage.load_trades(limit=TRADE_HISTORY_LIMIT))
-            self.log.emit(f"Paper account loaded ({Path(db_path).name}).")
+            currency = self._broker.currency
+            currency_text = f", currency {currency}" if currency else ""
+            self.log.emit(f"Paper account loaded ({Path(db_path).name}{currency_text}).")
             self.initialized.emit(True)
         except Exception as exc:  # noqa: BLE001 - report anything to the GUI instead of crashing
             logger.exception("Initialisation failed")
@@ -178,6 +186,11 @@ class EngineWorker(QObject):
             feed = self._get_feed(config.exchange_id)
             engine = BotEngine(config, feed, self._broker, self._storage)
             messages = engine.start()
+        except CurrencyMismatchError as exc:
+            # The GUI asks whether to reset the account (instead of a plain error box).
+            self._fail_start(str(exc), show_error=False)
+            self.currency_mismatch.emit(exc.account_currency, exc.pair_currency, str(exc))
+            return
         except (EngineError, DataFeedError, ValueError) as exc:
             self._fail_start(str(exc))
             return
@@ -277,9 +290,12 @@ class EngineWorker(QObject):
         self._broker.remember_marks(fresh)
         return {**self._broker.known_marks(), **fresh}
 
-    @Slot(float)
-    def reset_account(self, starting_balance: float) -> None:
-        """Wipe trades/positions and start again with `starting_balance` (only while stopped)."""
+    @Slot(float, str)
+    def reset_account(self, starting_balance: float, currency: str = "") -> None:
+        """Wipe trades/positions and start again with `starting_balance` in `currency`.
+
+        Only while stopped. An empty currency leaves it to be decided on the next start.
+        """
         if self._running:
             self.error.emit("Stop the bot before resetting the paper account.")
             return
@@ -290,7 +306,7 @@ class EngineWorker(QObject):
             self.error.emit(f"Starting balance must be at least {MIN_ORDER_QUOTE}.")
             return
         try:
-            self._broker.reset(starting_balance)
+            self._broker.reset(starting_balance, currency or None)
             settings = self._storage.load_settings() or BotConfig().to_dict()
             settings["starting_balance"] = float(starting_balance)
             self._storage.save_settings(settings)
@@ -300,7 +316,8 @@ class EngineWorker(QObject):
             return
         self.account_changed.emit(self._broker.snapshot({}))
         self.trades_loaded.emit(self._storage.load_trades(limit=TRADE_HISTORY_LIMIT))
-        self.log.emit(f"Paper account reset to {starting_balance:,.2f}.")
+        currency_text = f" {self._broker.currency}" if self._broker.currency else ""
+        self.log.emit(f"Paper account reset to {starting_balance:,.2f}{currency_text}.")
 
     @Slot(object)
     def save_settings(self, settings: dict) -> None:

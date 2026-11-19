@@ -13,7 +13,7 @@ import threading
 
 from traderbot.config import MIN_ORDER_QUOTE
 from traderbot.models import AccountSnapshot, Position, Side, Trade, TradeReason
-from traderbot.storage import Storage
+from traderbot.storage import ACCOUNT_CURRENCY_KEY, Storage
 
 logger = logging.getLogger(__name__)
 
@@ -254,8 +254,26 @@ class PaperBroker:
                 raise NoPosition(f"No open position in {symbol}")
             return self.market_sell(symbol, pos.amount, price, timestamp, reason)
 
-    def reset(self, starting_balance: float) -> None:
-        """Wipe trades/positions and start again with ``starting_balance`` cash."""
+    def reset(self, starting_balance: float, currency: str | None = None) -> None:
+        """Wipe trades/positions and start again with ``starting_balance`` cash in ``currency``.
+
+        With no currency the account's currency is cleared and decided on the next start.
+        """
         with self._lock:
-            self._storage.reset_account(starting_balance)
+            self._storage.reset_account(starting_balance, currency)
             self._load_state()
+
+    @property
+    def currency(self) -> str | None:
+        """Currency the cash is in (e.g. "USDT"), or None if not decided yet."""
+        with self._lock:
+            value = self._storage.get_meta(ACCOUNT_CURRENCY_KEY)
+        return str(value) if value else None
+
+    def set_currency(self, currency: str) -> None:
+        """Record the account currency (used once, when an account without one first starts)."""
+        currency = currency.strip().upper()
+        if not currency:
+            raise ValueError("Currency must not be empty")
+        with self._lock:
+            self._storage.set_meta(ACCOUNT_CURRENCY_KEY, currency)

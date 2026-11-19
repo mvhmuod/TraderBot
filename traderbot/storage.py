@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 # Meta keys starting with this prefix hold the equity at the start of a UTC day.
 DAY_START_PREFIX = "day_start:"
 SETTINGS_KEY = "settings"
+# Currency the paper account's cash is in (e.g. "USDT"). Missing = not decided yet.
+ACCOUNT_CURRENCY_KEY = "account_currency"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS account (
@@ -123,14 +125,16 @@ class Storage:
             return None
         return float(row[0]), float(row[1])
 
-    def reset_account(self, starting_balance: float) -> None:
+    def reset_account(self, starting_balance: float, currency: str | None = None) -> None:
         """Start a fresh paper account in ONE transaction.
 
         Deletes all trades, all positions and every ``day_start:*`` meta row, then
-        sets ``cash = starting_balance = starting_balance``. Other meta rows
-        (such as saved settings) are kept.
+        sets ``cash = starting_balance = starting_balance``. The account currency is
+        set to ``currency`` (or cleared when it is None/empty, so the next start decides
+        it). Other meta rows (such as saved settings) are kept.
         """
         balance = float(starting_balance)
+        currency = (currency or "").strip().upper()
         with self._transaction() as conn:
             conn.execute("DELETE FROM trades")
             conn.execute("DELETE FROM positions")
@@ -142,7 +146,21 @@ class Storage:
                 "starting_balance = excluded.starting_balance",
                 (balance, balance),
             )
-        logger.info("Paper account reset to %s", balance)
+            if currency:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (ACCOUNT_CURRENCY_KEY, json.dumps(currency)),
+                )
+            else:
+                conn.execute("DELETE FROM meta WHERE key = ?", (ACCOUNT_CURRENCY_KEY,))
+        logger.info("Paper account reset to %s %s", balance, currency or "(currency not set yet)")
+
+    def trade_symbols(self) -> list[str]:
+        """Return every symbol that appears in the trade history (sorted, no duplicates)."""
+        with self._lock:
+            rows = self._conn.execute("SELECT DISTINCT symbol FROM trades ORDER BY symbol").fetchall()
+        return [row[0] for row in rows]
 
     def load_positions(self) -> dict[str, Position]:
         """Return all open positions keyed by symbol."""

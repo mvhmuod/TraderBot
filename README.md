@@ -65,6 +65,15 @@ open, the bot keeps valuing that position at its latest price and still applies 
 take-profit and daily loss limit to it, but it only buys and sells on crossover signals for the
 selected pair.
 
+The paper account's cash is in one currency: the quote currency of the first pair you start
+(USDT for BTC/USDT), or the currency of the pair selected when you press **Reset paper account**.
+An account created by an earlier version of TraderBot takes the currency of its past trades and
+open positions; if those used more than one currency, the account has to be reset.
+Any pair priced in that currency can be traded (for example ETH/USDT next to BTC/USDT). If you
+press Start on a pair priced in a different currency (for example ETH/BTC on a USDT account), the
+bot does not start and offers to reset the paper account in the new currency. Answering No keeps
+everything as it was.
+
 Only one TraderBot window can use the paper account at a time. If TraderBot is already running
 (or an old window is still shutting down), a second copy shows "TraderBot is already running"
 and does not open the account.
@@ -112,7 +121,7 @@ and does not open the account.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | Exchange | binance | Where public market data comes from. |
-| Trading pair | BTC/USDT | The pair to paper-trade, written as BASE/QUOTE. |
+| Trading pair | BTC/USDT | The pair to paper-trade, written as BASE/QUOTE. Its QUOTE must be the paper account's currency (see Running). |
 | Timeframe | 5m | Candle length. The bot acts at most once per closed candle. Coinbase does not offer 4h. |
 | Fast SMA | 9 | Number of candles in the fast moving average (1 to 500). |
 | Slow SMA | 21 | Number of candles in the slow moving average (2 to 500, larger than the fast one). OKX and Coinbase return at most 300 candles, so there it can be at most 298. |
@@ -123,7 +132,7 @@ and does not open the account.
 | Fee | 0.100 % | Simulated exchange fee on every fill (below 10 %). |
 | Slippage | 0.050 % | Simulated price slippage on every fill (below 10 %). |
 | Poll interval | 15 s | How often the bot checks prices (at least 5 s). |
-| Starting balance | 10,000.00 | Cash for a fresh paper account. Only used when the account is created or when you press **Reset paper account**. |
+| Starting balance | 10,000.00 | Cash for a fresh paper account, in the selected pair's quote currency. Only used when the account is created or when you press **Reset paper account**. |
 
 All settings are locked while the bot is running. They are saved when the bot starts and when
 the window closes. Data is stored in `data/traderbot.db`, which stays on your computer and is
@@ -173,6 +182,8 @@ TraderBot/
 - Paper broker with fees, slippage, average cost and realized P&L.
 - Stop-loss, take-profit and daily loss limit.
 - Local SQLite storage of the paper account, trades and settings; paper account reset.
+- The paper account remembers its currency and refuses pairs priced in another one (with an
+  offer to reset).
 - Automated tests for every module.
 
 ### Ideas under discussion (not yet approved)
